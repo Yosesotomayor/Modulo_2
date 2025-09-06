@@ -9,7 +9,7 @@ def fit_standardizer(X):
     X = np.asarray(X)
     mu = X.mean(axis=0, keepdims=True)
     sigma = X.std(axis=0, keepdims=True)
-    sigma = np.where(sigma == 0, 1.0, sigma)  # evita división por cero
+    sigma = np.where(sigma == 0, 1.0, sigma)
     return mu, sigma
 
 def transform_standardizer(X, mu, sigma):
@@ -32,7 +32,7 @@ def train_test_split_stratified(X, y, test_size=0.2, seed=42):
 
     train_idx = np.array(train_idx)
     test_idx  = np.array(test_idx)
-    # Mezcla final por si quieres aleatoriedad global
+    
     rng.shuffle(train_idx)
     rng.shuffle(test_idx)
 
@@ -48,9 +48,9 @@ class NNMultiClass:
 
         self.weights = {}
         self.biases = {}
-        for l in range(self.L):
-            n_in, n_out = layer_sizes[l], layer_sizes[l+1]
-            if l < self.L - 1:  # capa oculta
+        for layer in range(self.L):
+            n_in, n_out = layer_sizes[layer], layer_sizes[layer+1]
+            if layer < self.L - 1: 
                 if hidden_activation.lower() == "relu":
                     # He
                     std = np.sqrt(2.0 / n_in)
@@ -59,8 +59,8 @@ class NNMultiClass:
             else:
                 std = np.sqrt(1.0 / n_in)
 
-            self.weights[l] = rng.normal(0.0, std, size=(n_in, n_out))
-            self.biases[l]  = np.zeros((1, n_out))
+            self.weights[layer] = rng.normal(0.0, std, size=(n_in, n_out))
+            self.biases[layer]  = np.zeros((1, n_out))
 
     @staticmethod
     def _relu(Z): return np.maximum(0, Z)
@@ -76,18 +76,18 @@ class NNMultiClass:
     def _forward(self, X):
         A = X
         caches = {"A0": X}
-        for l in range(self.L):
-            W, b = self.weights[l], self.biases[l]
+        for layer in range(self.L):
+            W, b = self.weights[layer], self.biases[layer]
             Z = A @ W + b
-            caches[f"Z{l+1}"] = Z
-            if l < self.L - 1:
+            caches[f"Z{layer+1}"] = Z
+            if layer < self.L - 1:
                 if self.hidden_activation == "relu":
                     A = self._relu(Z)
                 else:
                     A = np.tanh(Z)
             else:
                 A = self._softmax(Z)  
-            caches[f"A{l+1}"] = A
+            caches[f"A{layer+1}"] = A
         return A, caches
 
     # ---- Backward ----
@@ -97,16 +97,16 @@ class NNMultiClass:
         A_L = caches[f"A{self.L}"]
         dZ = (A_L - Y_onehot) 
 
-        for l in reversed(range(self.L)):
-            A_prev = caches[f"A{l}"]
-            W = self.weights[l]
+        for layer in reversed(range(self.L)):
+            A_prev = caches[f"A{layer}"]
+            W = self.weights[layer]
             dW = A_prev.T @ dZ / A_prev.shape[0]
             db = dZ.mean(axis=0, keepdims=True)
-            grads[f"dW{l}"] = dW
-            grads[f"db{l}"] = db
+            grads[f"dW{layer}"] = dW
+            grads[f"db{layer}"] = db
 
-            if l > 0:
-                Z_prev = caches[f"Z{l}"]
+            if layer > 0:
+                Z_prev = caches[f"Z{layer}"]
                 dA_prev = dZ @ W.T
                 if self.hidden_activation == "relu":
                     dZ = dA_prev * self._drelu(Z_prev)
@@ -115,9 +115,9 @@ class NNMultiClass:
         return grads
 
     def _step(self, grads):
-        for l in range(self.L):
-            self.weights[l] -= self.lr * grads[f"dW{l}"]
-            self.biases[l]  -= self.lr * grads[f"db{l}"]
+        for layer in range(self.L):
+            self.weights[layer] -= self.lr * grads[f"dW{layer}"]
+            self.biases[layer]  -= self.lr * grads[f"db{layer}"]
     @staticmethod
     def _cross_entropy(probs, Y_onehot, eps=1e-12):
         p = np.clip(probs, eps, 1 - eps)
@@ -197,26 +197,26 @@ class NNMultiClass:
         if biases is not None:
             Bd = _as_dict(biases, "biases")
 
-        for l, W_new in Wd.items():
-            if l not in self.weights:
-                raise ValueError(f"Capa {l} no existe (0..{self.L-1}).")
+        for layer, W_new in Wd.items():
+            if layer not in self.weights:
+                raise ValueError(f"Capa {layer} no existe (0..{self.L-1}).")
             W_new = np.asarray(W_new)
-            expected_shape = self.weights[l].shape
+            expected_shape = self.weights[layer].shape
             if W_new.shape != expected_shape:
                 raise ValueError(
-                    f"weights[{l}] forma {W_new.shape} != esperado {expected_shape}."
+                    f"weights[{layer}] forma {W_new.shape} != esperado {expected_shape}."
                 )
-            self.weights[l] = W_new
+            self.weights[layer] = W_new
 
-            if Bd is not None and l in Bd:
+            if Bd is not None and layer in Bd:
                 out_dim = expected_shape[1]
-                self.biases[l] = _coerce_bias(Bd[l], out_dim)
+                self.biases[layer] = _coerce_bias(Bd[layer], out_dim)
 
         if Bd is not None:
-            for l, b_new in Bd.items():
-                if l not in self.biases:
-                    raise ValueError(f"Capa {l} no existe para bias (0..{self.L-1}).")
-                if l in Wd:
+            for layer, b_new in Bd.items():
+                if layer not in self.biases:
+                    raise ValueError(f"Capa {layer} no existe para bias (0..{self.L-1}).")
+                if layer in Wd:
                     continue
-                out_dim = self.weights[l].shape[1]
-                self.biases[l] = _coerce_bias(b_new, out_dim)
+                out_dim = self.weights[layer].shape[1]
+                self.biases[layer] = _coerce_bias(b_new, out_dim)
