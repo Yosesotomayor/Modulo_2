@@ -5,6 +5,38 @@ def one_hot(y, n_classes):
     Y[np.arange(y.shape[0]), y] = 1.0
     return Y
 
+def fit_standardizer(X):
+    X = np.asarray(X)
+    mu = X.mean(axis=0, keepdims=True)
+    sigma = X.std(axis=0, keepdims=True)
+    sigma = np.where(sigma == 0, 1.0, sigma)  # evita división por cero
+    return mu, sigma
+
+def transform_standardizer(X, mu, sigma):
+    return (np.asarray(X) - mu) / sigma
+
+def train_test_split_stratified(X, y, test_size=0.2, seed=42):
+    rng = np.random.default_rng(seed)
+    X = np.asarray(X)
+    y = np.asarray(y).astype(int)
+
+    classes = np.unique(y)
+    train_idx, test_idx = [], []
+
+    for c in classes:
+        idx_c = np.where(y == c)[0]
+        rng.shuffle(idx_c)
+        n_test_c = int(np.floor(test_size * idx_c.shape[0]))
+        test_idx.extend(idx_c[:n_test_c])
+        train_idx.extend(idx_c[n_test_c:])
+
+    train_idx = np.array(train_idx)
+    test_idx  = np.array(test_idx)
+    # Mezcla final por si quieres aleatoriedad global
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+
+    return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
 
 class NNMultiClass:
     def __init__(self, layer_sizes, lr=1e-2, seed=42, hidden_activation="relu"):
