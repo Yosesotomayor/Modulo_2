@@ -1,0 +1,297 @@
+import numpy as np
+
+def one_hot(y, n_classes):
+    Y = np.zeros((y.shape[0], n_classes))
+    Y[np.arange(y.shape[0]), y] = 1.0
+    return Y
+
+def fit_standardizer(X):
+    X = np.asarray(X)
+    mu = X.mean(axis=0, keepdims=True)
+    sigma = X.std(axis=0, keepdims=True)
+    sigma = np.where(sigma == 0, 1.0, sigma)
+    return mu, sigma
+
+def transform_standardizer(X, mu, sigma):
+    return (np.asarray(X) - mu) / sigma
+
+def train_test_split_stratified(X, y, test_size=0.2, seed=42):
+    rng = np.random.default_rng(seed)
+    X = np.asarray(X)
+    y = np.asarray(y).astype(int)
+
+    classes = np.unique(y)
+    train_idx, test_idx = [], []
+
+    for c in classes:
+        idx_c = np.where(y == c)[0]
+        rng.shuffle(idx_c)
+        n_test_c = int(np.floor(test_size * idx_c.shape[0]))
+        test_idx.extend(idx_c[:n_test_c])
+        train_idx.extend(idx_c[n_test_c:])
+
+    train_idx = np.array(train_idx)
+    test_idx  = np.array(test_idx)
+    
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+
+    return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
+
+def class_weights_from_y(y):
+    y = np.asarray(y).astype(int)
+    classes, counts = np.unique(y, return_counts=True)
+    # inverso de la frecuencia normalizado
+    w = counts.sum() / (len(classes) * counts)
+    # vector de pesos alineado por índice de clase (0..K-1)
+    W = np.zeros(classes.max()+1, dtype=np.float64)
+    W[classes] = w
+    return W
+
+class NNMultiClass:
+    def __init__(self, layer_sizes, lr=1e-2, seed=42, hidden_activation="relu"):
+        rng = np.random.default_rng(seed)
+        self.layer_sizes = layer_sizes
+        self.L = len(layer_sizes) - 1
+        self.lr = lr
+        self.hidden_activation = hidden_activation
+
+        self.weights = {}
+        self.biases = {}
+        for layer in range(self.L):
+            n_in, n_out = layer_sizes[layer], layer_sizes[layer+1]
+            if layer < self.L - 1: 
+                if hidden_activation.lower() == "relu":
+                    # He
+                    std = np.sqrt(2.0 / n_in)
+                else:
+                    std = np.sqrt(1.0 / n_in)
+            else:
+                std = np.sqrt(1.0 / n_in)
+
+            self.weights[layer] = rng.normal(0.0, std, size=(n_in, n_out))
+            self.biases[layer]  = np.zeros((1, n_out))
+            self.weights[layer] = self.weights[layer].astype(np.float64)
+            self.biases[layer]  = self.biases[layer].astype(np.float64)
+
+    @staticmethod
+    def _relu(Z): return np.maximum(0, Z)
+    @staticmethod
+    def _drelu(Z): return (Z > 0).astype(Z.dtype)
+
+    @staticmethod
+    def _softmax(Z):
+        Z = np.asarray(Z, dtype=np.float64)
+        if Z.ndim == 1:
+            Z = Z[None, :]
+        Z = Z - Z.max(axis=1, keepdims=True)
+        Z = np.exp(Z)
+        denom = Z.sum(axis=1, keepdims=True)
+        # Evita divisiones por cero si aparece un batch degenerado
+        denom = np.where(denom == 0.0, 1.0, denom)
+        return Z / denom
+
+    def _forward(self, X):
+        A = np.asarray(X, dtype=np.float64)
+        if A.ndim == 1:
+            A = A[None, :]
+        caches = {"A0": A}
+        for layer in range(self.L):
+            W = np.asarray(self.weights[layer], dtype=np.float64)
+            b = np.asarray(self.biases[layer], dtype=np.float64)
+            Z = A @ W + b
+            caches[f"Z{layer+1}"] = Z
+            if layer < self.L - 1:
+                if self.hidden_activation == "relu":
+                    A = self._relu(Z)
+                else:
+                    A = np.tanh(Z)
+            else:
+                A = self._softmax(Z)  
+            caches[f"A{layer+1}"] = A
+        return A, caches
+
+    # ---- Backward ----
+    def _backward(self, caches, Y_onehot):
+        grads = {}
+        # dA en la salida con CE + Softmax: dZ = A - Y POR LO TANTO SE NECESITAN 2 NEURONAS DE SALIDA ! 
+        A_L = caches[f"A{self.L}"]
+        dZ = (A_L - Y_onehot) 
+
+        for layer in reversed(range(self.L)):
+            A_prev = caches[f"A{layer}"]
+            W = self.weights[layer]
+            dW = A_prev.T @ dZ / A_prev.shape[0]
+            db = dZ.mean(axis=0, keepdims=True)
+            grads[f"dW{layer}"] = dW
+            grads[f"db{layer}"] = db
+
+            if layer > 0:
+                Z_prev = caches[f"Z{layer}"]
+                dA_prev = dZ @ W.T
+                if self.hidden_activation == "relu":
+                    dZ = dA_prev * self._drelu(Z_prev)
+                else:
+                    dZ = dA_prev * (1.0 - np.tanh(Z_prev) ** 2)
+        return grads
+
+    def _step(self, grads):
+        for layer in range(self.L):
+            self.weights[layer] -= self.lr * grads[f"dW{layer}"]
+            self.biases[layer]  -= self.lr * grads[f"db{layer}"]
+    @staticmethod
+    def _cross_entropy(probs, Y_onehot, eps=1e-12):
+        p = np.clip(probs, eps, 1 - eps)
+        return -np.mean(np.sum(Y_onehot * np.log(p), axis=1))
+
+    def fit(self, X, y, epochs=200, batch_size=64, verbose=True, class_weights=None):
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y).astype(int)
+        if X.ndim != 2:
+            raise ValueError(...)
+        n, n_classes = X.shape[0], self.layer_sizes[-1]
+        Y = one_hot(y, n_classes)
+
+        if class_weights is None:
+            # pesos = 1 para todos
+            class_weights = np.ones(n_classes, dtype=np.float64)
+        else:
+            class_weights = np.asarray(class_weights, dtype=np.float64)
+
+        idx = np.arange(n)
+        for ep in range(1, epochs + 1):
+            np.random.shuffle(idx)
+            Xs, Ys = X[idx], Y[idx]
+            ys_ord = y[idx]
+
+            for i in range(0, n, batch_size):
+                xb = Xs[i:i+batch_size]
+                yb = Ys[i:i+batch_size]
+                yb_classes = ys_ord[i:i+batch_size]
+
+                probs, caches = self._forward(xb)
+
+                # --- pesos por muestra segun su clase ---
+                w = class_weights[yb_classes]            # shape (B,)
+                w = w.reshape(-1, 1)                      # (B,1)
+
+                # gradiente ponderado en la salida
+                dZ = (probs - yb) * w                     # (B,C)
+
+                # backward como antes, pero pasando dZ inicial
+                grads = self._backward_weighted(caches, dZ, w)
+
+                # paso de gradiente
+                self._step(grads)
+
+            # métrica/ pérdida ponderada (opcional pero útil)
+            probs_full, _ = self._forward(X)
+            eps = 1e-12
+            p = np.clip(probs_full, eps, 1-eps)
+            # pérdida ponderada por muestra
+            w_full = class_weights[y].reshape(-1,1)
+            loss = -np.sum(w_full * (Y*np.log(p))) / np.sum(w_full)
+            if verbose and (ep % max(1, epochs // 10) == 0 or ep == 1):
+                acc = (probs_full.argmax(axis=1) == y).mean()
+                print(f"Epoch {ep:4d} | loss={loss:.4f} | acc={acc:.4f}")
+
+    # versión del backward que toma dZ inicial y normaliza por suma de pesos
+    def _backward_weighted(self, caches, dZ, w):
+        grads = {}
+        # suma de pesos del batch (evita dividir por B)
+        norm = float(np.sum(w))
+        for layer in reversed(range(self.L)):
+            A_prev = caches[f"A{layer}"]
+            W = self.weights[layer]
+            dW = (A_prev.T @ dZ) / norm
+            db = dZ.sum(axis=0, keepdims=True) / norm
+            grads[f"dW{layer}"] = dW
+            grads[f"db{layer}"] = db
+
+            if layer > 0:
+                Z_prev = caches[f"Z{layer}"]
+                dA_prev = dZ @ W.T
+                if self.hidden_activation == "relu":
+                    dZ = dA_prev * self._drelu(Z_prev)
+                else:
+                    dZ = dA_prev * (1.0 - np.tanh(Z_prev) ** 2)
+        return grads
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X[None, :]
+        probs, _ = self._forward(X)
+        return probs
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X[None, :]
+        return self.predict_proba(X).argmax(axis=1)
+
+    def show_weights(self):
+        for i, W in self.weights.items():
+            print(f"\nPesos capa {i} ({W.shape[0]} → {W.shape[1]}):")
+            print(W)
+
+    def set_weights(self, weights, biases=None, strict=True):
+        import numpy as np
+
+        def _is_seq(x):
+            return isinstance(x, (list, tuple))
+
+        def _as_dict(obj, name):
+            if isinstance(obj, dict):
+                return obj
+            if _is_seq(obj):
+                if len(obj) != self.L:
+                    raise ValueError(f"{name} debe tener longitud {self.L}; recibí {len(obj)}.")
+                return {i: obj[i] for i in range(self.L)}
+            raise ValueError(f"{name} debe ser list/tuple o dict.")
+
+        def _coerce_bias(b, out_dim):
+            b = np.asarray(b)
+            if b.ndim == 1:
+                if b.shape[0] != out_dim:
+                    raise ValueError(f"Bias dim inválida: esperado ({out_dim},) o (1,{out_dim}), recibí {b.shape}.")
+                return b.reshape(1, -1)
+            if b.ndim == 2:
+                if b.shape != (1, out_dim):
+                    if strict:
+                        raise ValueError(f"Bias forma inválida: esperado (1,{out_dim}), recibí {b.shape}.")
+                    if b.shape == (out_dim, 1):
+                        return b.T
+                    raise ValueError(f"Bias forma incompatible: {b.shape}.")
+                return b
+            raise ValueError(f"Bias debe ser vector o matriz fila, recibí ndim={b.ndim}.")
+
+        Wd = _as_dict(weights, "weights")
+
+        Bd = None
+        if biases is not None:
+            Bd = _as_dict(biases, "biases")
+
+        for layer, W_new in Wd.items():
+            if layer not in self.weights:
+                raise ValueError(f"Capa {layer} no existe (0..{self.L-1}).")
+            W_new = np.asarray(W_new)
+            expected_shape = self.weights[layer].shape
+            if W_new.shape != expected_shape:
+                raise ValueError(
+                    f"weights[{layer}] forma {W_new.shape} != esperado {expected_shape}."
+                )
+            self.weights[layer] = W_new
+
+            if Bd is not None and layer in Bd:
+                out_dim = expected_shape[1]
+                self.biases[layer] = _coerce_bias(Bd[layer], out_dim)
+
+        if Bd is not None:
+            for layer, b_new in Bd.items():
+                if layer not in self.biases:
+                    raise ValueError(f"Capa {layer} no existe para bias (0..{self.L-1}).")
+                if layer in Wd:
+                    continue
+                out_dim = self.weights[layer].shape[1]
+                self.biases[layer] = _coerce_bias(b_new, out_dim)
