@@ -38,6 +38,16 @@ def train_test_split_stratified(X, y, test_size=0.2, seed=42):
 
     return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
 
+def class_weights_from_y(y):
+    y = np.asarray(y).astype(int)
+    classes, counts = np.unique(y, return_counts=True)
+    # inverso de la frecuencia normalizado
+    w = counts.sum() / (len(classes) * counts)
+    # vector de pesos alineado por índice de clase (0..K-1)
+    W = np.zeros(classes.max()+1, dtype=np.float64)
+    W[classes] = w
+    return W
+
 class NNMultiClass:
     def __init__(self, layer_sizes, lr=1e-2, seed=42, hidden_activation="relu"):
         rng = np.random.default_rng(seed)
@@ -61,6 +71,8 @@ class NNMultiClass:
 
             self.weights[layer] = rng.normal(0.0, std, size=(n_in, n_out))
             self.biases[layer]  = np.zeros((1, n_out))
+            self.weights[layer] = self.weights[layer].astype(np.float64)
+            self.biases[layer]  = self.biases[layer].astype(np.float64)
 
     @staticmethod
     def _relu(Z): return np.maximum(0, Z)
@@ -69,15 +81,24 @@ class NNMultiClass:
 
     @staticmethod
     def _softmax(Z):
-        Zs = Z - Z.max(axis=1, keepdims=True)
-        e = np.exp(Zs)
-        return e / e.sum(axis=1, keepdims=True)
+        Z = np.asarray(Z, dtype=np.float64)
+        if Z.ndim == 1:
+            Z = Z[None, :]
+        Z = Z - Z.max(axis=1, keepdims=True)
+        Z = np.exp(Z)
+        denom = Z.sum(axis=1, keepdims=True)
+        # Evita divisiones por cero si aparece un batch degenerado
+        denom = np.where(denom == 0.0, 1.0, denom)
+        return Z / denom
 
     def _forward(self, X):
-        A = X
-        caches = {"A0": X}
+        A = np.asarray(X, dtype=np.float64)
+        if A.ndim == 1:
+            A = A[None, :]
+        caches = {"A0": A}
         for layer in range(self.L):
-            W, b = self.weights[layer], self.biases[layer]
+            W = np.asarray(self.weights[layer], dtype=np.float64)
+            b = np.asarray(self.biases[layer], dtype=np.float64)
             Z = A @ W + b
             caches[f"Z{layer+1}"] = Z
             if layer < self.L - 1:
@@ -123,36 +144,90 @@ class NNMultiClass:
         p = np.clip(probs, eps, 1 - eps)
         return -np.mean(np.sum(Y_onehot * np.log(p), axis=1))
 
-    def fit(self, X, y, epochs=200, batch_size=64, verbose=True):
+    def fit(self, X, y, epochs=200, batch_size=64, verbose=True, class_weights=None):
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y).astype(int)
+        if X.ndim != 2:
+            raise ValueError(...)
         n, n_classes = X.shape[0], self.layer_sizes[-1]
-        Y = one_hot(y.astype(int), n_classes)
+        Y = one_hot(y, n_classes)
+
+        if class_weights is None:
+            # pesos = 1 para todos
+            class_weights = np.ones(n_classes, dtype=np.float64)
+        else:
+            class_weights = np.asarray(class_weights, dtype=np.float64)
 
         idx = np.arange(n)
         for ep in range(1, epochs + 1):
             np.random.shuffle(idx)
             Xs, Ys = X[idx], Y[idx]
+            ys_ord = y[idx]
 
-            # Minibatches
             for i in range(0, n, batch_size):
                 xb = Xs[i:i+batch_size]
                 yb = Ys[i:i+batch_size]
+                yb_classes = ys_ord[i:i+batch_size]
 
                 probs, caches = self._forward(xb)
-                grads = self._backward(caches, yb)
+
+                # --- pesos por muestra segun su clase ---
+                w = class_weights[yb_classes]            # shape (B,)
+                w = w.reshape(-1, 1)                      # (B,1)
+
+                # gradiente ponderado en la salida
+                dZ = (probs - yb) * w                     # (B,C)
+
+                # backward como antes, pero pasando dZ inicial
+                grads = self._backward_weighted(caches, dZ, w)
+
+                # paso de gradiente
                 self._step(grads)
 
-            # Métrica por época
+            # métrica/ pérdida ponderada (opcional pero útil)
             probs_full, _ = self._forward(X)
-            loss = self._cross_entropy(probs_full, Y)
+            eps = 1e-12
+            p = np.clip(probs_full, eps, 1-eps)
+            # pérdida ponderada por muestra
+            w_full = class_weights[y].reshape(-1,1)
+            loss = -np.sum(w_full * (Y*np.log(p))) / np.sum(w_full)
             if verbose and (ep % max(1, epochs // 10) == 0 or ep == 1):
                 acc = (probs_full.argmax(axis=1) == y).mean()
                 print(f"Epoch {ep:4d} | loss={loss:.4f} | acc={acc:.4f}")
 
+    # versión del backward que toma dZ inicial y normaliza por suma de pesos
+    def _backward_weighted(self, caches, dZ, w):
+        grads = {}
+        # suma de pesos del batch (evita dividir por B)
+        norm = float(np.sum(w))
+        for layer in reversed(range(self.L)):
+            A_prev = caches[f"A{layer}"]
+            W = self.weights[layer]
+            dW = (A_prev.T @ dZ) / norm
+            db = dZ.sum(axis=0, keepdims=True) / norm
+            grads[f"dW{layer}"] = dW
+            grads[f"db{layer}"] = db
+
+            if layer > 0:
+                Z_prev = caches[f"Z{layer}"]
+                dA_prev = dZ @ W.T
+                if self.hidden_activation == "relu":
+                    dZ = dA_prev * self._drelu(Z_prev)
+                else:
+                    dZ = dA_prev * (1.0 - np.tanh(Z_prev) ** 2)
+        return grads
+
     def predict_proba(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X[None, :]
         probs, _ = self._forward(X)
         return probs
 
     def predict(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X[None, :]
         return self.predict_proba(X).argmax(axis=1)
 
     def show_weights(self):
